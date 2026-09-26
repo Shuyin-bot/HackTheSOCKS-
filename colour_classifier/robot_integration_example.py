@@ -2,11 +2,13 @@
 
 Close-up flow on the robot, for each known sock location:
 
-    from colour_classifier import identify_sock
-    from colour_classifier.robot_integration_example import CAMERA, place_waypoint
+    from colour_classifier import ArmCamera, read_sock_colour
+    from colour_classifier.robot_integration_example import place_waypoint
 
+    cam = ArmCamera(0)                              # wrist webcam index, open once at start-up
     go_to(view_pose_for_spot)                       # camera pointing straight at the sock
-    colour = identify_sock(robot.get_observation()[CAMERA])
+    colour = read_sock_colour(cam)                  # 5 fresh frames, averaged + voted
+    # (if LeRobot owns the camera instead: identify_sock(robot.get_observation()[CAMERA]))
     target = place_waypoint(colour)
     if target is not None:                          # None = empty/unknown: leave it
         go_to(pick_pose_for_spot); grab()

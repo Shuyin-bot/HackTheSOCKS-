@@ -3,9 +3,12 @@
 CLOSE-UP (current plan): the arm moves to each known spot and the wrist camera
 points straight at one sock. We read the middle of the frame and return one colour.
 
-    from sock_classifier import identify_sock
-    obs = robot.get_observation()          # arm at the spot, camera pointing at the sock
-    colour = identify_sock(obs["wrist"])   # -> "blue" / "empty" / "unknown"
+    from sock_classifier import ArmCamera, read_sock_colour
+    cam = ArmCamera(0)                     # wrist webcam index (or IP-cam URL); open once
+    colour = read_sock_colour(cam)         # arm at the spot -> "blue" / "empty" / "unknown"
+
+  or, if LeRobot already owns the camera:
+    colour = identify_sock(robot.get_observation()["wrist"])
 
   Setup (with the real wrist camera, at the real close-up pose):
     python sock_classifier.py closeup-teach --camera 1   # SPACE per sock, type its colour
@@ -62,6 +65,12 @@ MAX_DIST = 30.0
 TABLE_GREY = 180.0
 # Close-up mode reads a centred box this fraction of the frame's width/height.
 CENTRE = 0.5
+# Cheap webcam handling: frames per reading (averaged + voted), seconds to let
+# auto-exposure settle after opening (first frames are dark), and stale frames
+# dropped before each reading (so we don't read what the camera saw mid-move).
+N_FRAMES = 5
+WARMUP_S = 1.5
+FLUSH_FRAMES = 5
 # Windows are shown at most this wide so they fit on a laptop screen.
 DISPLAY_WIDTH = 1280
 
@@ -222,32 +231,123 @@ class CloseUpClassifier:
         return sorted(self.colours)
 
     def lab(self, image, rgb: bool = True) -> np.ndarray:
-        return spot_lab(to_bgr_uint8(image, rgb), self.box, NO_SCALE)
+        return closeup_lab(to_bgr_uint8(image, rgb), self.box)
 
     def classify_detailed(self, image, rgb: bool = True) -> tuple[str, float]:
-        """(colour, distance); distance < ~10 is a confident match."""
-        return nearest(self.lab(image, rgb), self.refs, self.max_dist)
+        """(colour, distance); distance < ~10 is a confident match.
+
+        `image` can be one frame or a list of frames. With several frames their colours
+        are averaged (beats webcam noise) and each frame votes; if most frames disagree
+        with the result (arm still moving, sock half in view) it returns "unknown".
+        """
+        frames = image if isinstance(image, (list, tuple)) else [image]
+        labs = [self.lab(f, rgb) for f in frames]
+        colour, dist = nearest(np.median(labs, axis=0), self.refs, self.max_dist)
+        if len(labs) > 1:
+            votes = [nearest(lab, self.refs, self.max_dist)[0] for lab in labs]
+            if votes.count(colour) <= len(votes) / 2:
+                colour = UNKNOWN
+        return colour, dist
 
     def classify(self, image, rgb: bool = True) -> str:
-        """Colour of the sock in the middle of the frame. `rgb=False` for raw OpenCV (BGR) frames."""
+        """Colour of the sock in the middle of the frame(s). `rgb=False` for raw OpenCV (BGR) frames."""
         return self.classify_detailed(image, rgb)[0]
+
+    def read(self, camera: "ArmCamera", n: int = N_FRAMES) -> tuple[str, float]:
+        """Take a fresh multi-frame reading from the webcam: (colour, distance)."""
+        return self.classify_detailed(camera.frames(n), rgb=False)
+
+
+def closeup_lab(frame_bgr: np.ndarray, box: list[float]) -> np.ndarray:
+    """Median Lab of the reading box, shrunk to 32x32 first: area-averaging smooths out
+    the noise, blur and JPEG blocks of a cheap webcam before we take the colour."""
+    patch = cv2.resize(crop(frame_bgr, box), (32, 32), interpolation=cv2.INTER_AREA)
+    lab = cv2.cvtColor(patch.astype(np.float32) / 255.0, cv2.COLOR_BGR2LAB)
+    return np.median(lab.reshape(-1, 3), axis=0)
+
+
+class ArmCamera:
+    """The wrist webcam, read carefully because it's a cheap camera. Frames are BGR.
+
+    source: camera index (0, 1, ...), a video stream URL, or a phone IP-webcam snapshot
+    URL ending in .jpg (like ip_cam.py). Open it once and keep it open; opening takes
+    WARMUP_S seconds while auto-exposure settles.
+    """
+
+    def __init__(self, source=0, width: int | None = None, height: int | None = None, warmup_s: float = WARMUP_S):
+        self.source = int(source) if str(source).isdigit() else source
+        path = str(self.source).lower().split("?")[0]
+        self.snapshot = isinstance(self.source, str) and path.endswith((".jpg", ".jpeg", ".png"))
+        self.cap = None
+        if not self.snapshot:
+            self.cap = cv2.VideoCapture(self.source)
+            if width and height:
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            if not self.cap.isOpened():
+                raise RuntimeError(f"Could not open camera {self.source}. Check the index (`make find-cameras`).")
+            end = time.time() + warmup_s
+            while time.time() < end:
+                self.cap.read()
+        self.read()  # fail now rather than mid-run
+
+    def read(self) -> np.ndarray:
+        """Next frame (BGR)."""
+        frame = None
+        if self.snapshot:
+            import requests
+            data = requests.get(self.source, timeout=10).content
+            frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+        else:
+            ok, frame = self.cap.read()
+            frame = frame if ok else None
+        if frame is None:
+            raise RuntimeError(f"No frame from camera {self.source}")
+        return frame
+
+    def frames(self, n: int = N_FRAMES) -> list[np.ndarray]:
+        """n fresh frames; frames buffered while the arm was moving are thrown away first."""
+        if self.cap is not None:
+            for _ in range(FLUSH_FRAMES):
+                self.cap.grab()
+        return [self.read() for _ in range(n)]
+
+    def close(self):
+        if self.cap is not None:
+            self.cap.release()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
 
 NO_SCALE = np.ones(3, dtype=np.float32)
 _default_closeup: CloseUpClassifier | None = None
 
 
-def identify_sock(image, rgb: bool = True) -> str:
-    """Robot entry point (close-up mode): camera frame pointing at a sock -> its colour.
-
-    `image` is what LeRobot gives you in robot.get_observation()[camera_name]
-    (RGB, HxWx3 uint8). Torch tensors / CHW / float images also work.
-    Returns a taught colour name, "empty" (if taught), or "unknown" (don't act on it).
-    """
+def _closeup() -> CloseUpClassifier:
     global _default_closeup
     if _default_closeup is None:
         _default_closeup = CloseUpClassifier()
-    return _default_closeup.classify(image, rgb)
+    return _default_closeup
+
+
+def identify_sock(image, rgb: bool = True) -> str:
+    """Robot entry point (close-up mode): camera frame(s) pointing at a sock -> its colour.
+
+    `image` is what LeRobot gives you in robot.get_observation()[camera_name]
+    (RGB, HxWx3 uint8), or a list of a few such frames (more reliable on a bad camera).
+    Torch tensors / CHW / float images also work.
+    Returns a taught colour name, "empty" (if taught), or "unknown" (don't act on it).
+    """
+    return _closeup().classify(image, rgb)
+
+
+def read_sock_colour(camera: ArmCamera, n: int = N_FRAMES) -> str:
+    """Robot entry point when you own the webcam: fresh n-frame reading -> colour."""
+    return _closeup().read(camera, n)[0]
 
 
 # ── window helpers ──────────────────────────────────────────────────────────
@@ -302,7 +402,7 @@ def draw(img: np.ndarray, spots: dict, labels=None, highlight=None) -> np.ndarra
 
 
 def open_camera(args) -> cv2.VideoCapture:
-    cap = cv2.VideoCapture(args.camera)
+    cap = cv2.VideoCapture(int(args.camera) if str(args.camera).isdigit() else args.camera)
     if args.width and args.height:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
@@ -480,33 +580,32 @@ def cmd_closeup_teach(args):
     shots = CAPTURE_DIR / "closeup"
     shots.mkdir(parents=True, exist_ok=True)
 
-    def teach(frame) -> None:
-        label = type_label(draw_centre(fit(frame), args.centre), "colour:", window="camera")
+    def teach(frames: list) -> None:
+        label = type_label(draw_centre(fit(frames[0]), args.centre), "colour:", window="camera")
         if not label:
             return
-        colours.setdefault(label, []).append([round(float(v), 2) for v in spot_lab(frame, box, NO_SCALE)])
+        lab = np.median([closeup_lab(f, box) for f in frames], axis=0)
+        colours.setdefault(label, []).append([round(float(v), 2) for v in lab])
         CLOSEUP_COLOURS_FILE.write_text(json.dumps(colours, indent=2))
-        cv2.imwrite(str(shots / f"{label}_{time.strftime('%H%M%S')}.png"), frame)
+        cv2.imwrite(str(shots / f"{label}_{time.strftime('%H%M%S')}.png"), frames[0])
         print(f"Saved '{label}' ({len(colours[label])} reading(s)). Known colours: {sorted(colours)}")
 
     if args.image:
-        teach(get_frame(args))
+        teach([get_frame(args)])
         close_windows()
         return
-    cap = open_camera(args)
+    cam = ArmCamera(args.camera, args.width, args.height)
     print("Point the camera at a sock (as the robot will), SPACE to capture, q when done.")
     while True:
-        ok, frame = cap.read()
-        if not ok:
-            continue
+        frame = cam.read()
         cv2.imshow("camera", banner(draw_centre(fit(frame), args.centre),
                                     "Point at a sock. SPACE = capture    q = done"))
         key = cv2.waitKey(1) & 0xFF
         if key == ord(" "):
-            teach(frame)
+            teach(cam.frames())  # same multi-frame reading the robot uses
         elif key in (ord("q"), 27):
             break
-    cap.release()
+    cam.close()
     close_windows()
 
 
@@ -521,27 +620,28 @@ def cmd_closeup_run(args):
         cv2.waitKey(0)
         close_windows()
         return
-    cap = open_camera(args)
-    print("Live view: SPACE prints the colour, q quits.")
+    cam = ArmCamera(args.camera, args.width, args.height)
+    recent = []
+    print("Live view (last 5 frames combined): SPACE = fresh reading like the robot does, q quits.")
     while True:
-        ok, frame = cap.read()
-        if not ok:
-            continue
-        colour, dist = clf.classify_detailed(frame, rgb=False)
-        cv2.imshow("run", banner(show(frame, colour, dist), "SPACE = print colour    q = quit"))
+        frame = cam.read()
+        recent = (recent + [frame])[-N_FRAMES:]
+        colour, dist = clf.classify_detailed(recent, rgb=False)
+        cv2.imshow("run", banner(show(frame, colour, dist), "SPACE = robot-style reading    q = quit"))
         key = cv2.waitKey(1) & 0xFF
         if key == ord(" "):
+            colour, dist = clf.read(cam)
             print(colour, f"(distance {dist:.1f})")
         elif key in (ord("q"), 27):
             break
-    cap.release()
+    cam.close()
     close_windows()
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("command", choices=["closeup-teach", "closeup-run", "capture", "spots", "teach", "run"])
-    p.add_argument("--camera", type=int, default=0)
+    p.add_argument("--camera", default="0", help="webcam index, or a stream / IP-cam snapshot URL")
     p.add_argument("--image", help="use a saved picture instead of the live camera")
     p.add_argument("--max-dist", type=float, default=MAX_DIST)
     p.add_argument("--free", action="store_true", help="teach: box each sock by hand instead of using spots.json")

@@ -29,6 +29,7 @@ sock. Find the camera index with `make find-cameras`.
 
 ```bash
 python colour_classifier/sock_classifier.py closeup-teach --camera 1
+# phone IP webcam instead:  --camera http://IP:8080/photoaf.jpg
 ```
 
 A live preview shows the box that gets read. Put a sock under the camera and press **SPACE**,
@@ -36,6 +37,8 @@ then type its colour in the window (`black`, `white`, `blue`, `orange`) and pres
 Repeat for each sock. Also point the camera at bare table and type `empty`. Press **q** when
 you're done.
 
+- Each SPACE takes the same 5-frame reading the robot uses, so what you teach matches
+  what the robot sees, even with the arm camera's poor image.
 - Every capture adds a reading to `colours_closeup.json`, and nothing is overwritten. Two or
   three captures per sock, with the sock moved slightly each time, make it more reliable.
 - The colour names you type are exactly what `identify_sock` returns. Use the same names in
@@ -49,13 +52,34 @@ python colour_classifier/sock_classifier.py closeup-run --camera 1
 
 ## 3. Use it in the robot code
 
-Run from the repo root (or put the repo root on `PYTHONPATH`):
+Run from the repo root (or put the repo root on `PYTHONPATH`).
+
+**Option A: your script opens the wrist webcam itself (recommended for the cheap arm camera).**
+
+```python
+from colour_classifier import ArmCamera, read_sock_colour
+
+cam = ArmCamera(0)              # webcam index (or an IP-cam URL). Open ONCE at start-up (~1.5 s warm-up)
+# ... move the arm so the camera points at a sock ...
+colour = read_sock_colour(cam)  # "blue" / "empty" / "unknown"
+cam.close()                     # at the end
+```
+
+`ArmCamera` handles the usual problems with bad webcams:
+- **Dark first frames.** It waits for auto-exposure to settle when it opens.
+- **Stale frames.** It throws away frames the camera buffered while the arm was moving.
+- **Noise, blur and compression blocks.** Each reading averages 5 frames, and each frame
+  votes. If the frames disagree (the arm is still moving, or the sock is half in view),
+  it returns `"unknown"` rather than a wrong colour.
+
+**Option B: LeRobot already owns the camera.**
 
 ```python
 from colour_classifier import identify_sock
 
 obs = robot.get_observation()          # arm at the spot, camera pointing at the sock
 colour = identify_sock(obs["wrist"])   # "wrist" = the camera's name in your robot config
+# more reliable on a bad camera: pass a few frames, identify_sock([f1, f2, f3, f4, f5])
 ```
 
 `identify_sock` returns a string:
