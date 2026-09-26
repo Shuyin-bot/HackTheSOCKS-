@@ -54,6 +54,8 @@ HERE = Path(__file__).parent
 SPOTS_FILE = HERE / "spots.json"
 COLOURS_FILE = HERE / "colours.json"
 CLOSEUP_COLOURS_FILE = HERE / "colours_closeup.json"
+# Used until `closeup-teach` has been run on this machine: taught from phone photos of our socks.
+SAMPLE_CLOSEUP_COLOURS_FILE = HERE / "samples" / "colours_closeup_phone.json"
 CAPTURE_DIR = HERE / "captures"
 
 # Only the centre of each box is used, so small pose errors don't pull in the table.
@@ -214,7 +216,13 @@ class CloseUpClassifier:
     colours with the same camera at the same pose the robot uses.
     """
 
-    def __init__(self, colours_file=CLOSEUP_COLOURS_FILE, centre=CENTRE, max_dist=MAX_DIST):
+    def __init__(self, colours_file=None, centre=CENTRE, max_dist=MAX_DIST):
+        if colours_file is None:
+            colours_file = CLOSEUP_COLOURS_FILE
+            if not colours_file.exists():
+                colours_file = SAMPLE_CLOSEUP_COLOURS_FILE
+                print(f"[sock_classifier] No {CLOSEUP_COLOURS_FILE.name} yet, using the sample colours from phone "
+                      "photos. Run `closeup-teach` with the arm camera for reliable results.")
         self.colours_file, self.box, self.max_dist = Path(colours_file), centre_box(centre), max_dist
         self.reload()
 
@@ -609,14 +617,30 @@ def cmd_closeup_teach(args):
     close_windows()
 
 
+def swatch(img: np.ndarray, lab: np.ndarray) -> np.ndarray:
+    """Paint the measured centre colour as a patch in the top-right corner, with its RGB."""
+    bgr = cv2.cvtColor(lab.reshape(1, 1, 3).astype(np.float32), cv2.COLOR_LAB2BGR)[0, 0]
+    bgr = tuple(int(v) for v in np.clip(bgr * 255, 0, 255))
+    w = img.shape[1]
+    cv2.rectangle(img, (w - 170, 10), (w - 10, 110), bgr, -1)
+    cv2.rectangle(img, (w - 170, 10), (w - 10, 110), (255, 255, 255), 2)
+    cv2.putText(img, f"RGB {bgr[2]},{bgr[1]},{bgr[0]}", (w - 170, 135), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                (255, 255, 255), 2)
+    return img
+
+
 def cmd_closeup_run(args):
     clf = CloseUpClassifier(centre=args.centre, max_dist=args.max_dist)
-    show = lambda frame, c, d: draw_centre(fit(frame), args.centre, f"{c} ({d:.0f})")
+    print(f"Colours it knows: {clf.colour_names}  (from {clf.colours_file.name})")
+
+    def show(frames, c, d):
+        img = draw_centre(fit(frames[-1]), args.centre, f"{c} ({d:.0f})")
+        return swatch(img, np.median([clf.lab(f, rgb=False) for f in frames], axis=0))
     if args.image:
         frame = get_frame(args)
         colour, dist = clf.classify_detailed(frame, rgb=False)
         print(json.dumps({"colour": colour, "distance": round(dist, 1)}))
-        cv2.imshow("run", banner(show(frame, colour, dist), "Press any key to close"))
+        cv2.imshow("run", banner(show([frame], colour, dist), "Press any key to close"))
         cv2.waitKey(0)
         close_windows()
         return
@@ -627,7 +651,7 @@ def cmd_closeup_run(args):
         frame = cam.read()
         recent = (recent + [frame])[-N_FRAMES:]
         colour, dist = clf.classify_detailed(recent, rgb=False)
-        cv2.imshow("run", banner(show(frame, colour, dist), "SPACE = robot-style reading    q = quit"))
+        cv2.imshow("run", banner(show(recent, colour, dist), "SPACE = robot-style reading    q = quit"))
         key = cv2.waitKey(1) & 0xFF
         if key == ord(" "):
             colour, dist = clf.read(cam)
