@@ -60,8 +60,12 @@ CAPTURE_DIR = HERE / "captures"
 
 # Only the centre of each box is used, so small pose errors don't pull in the table.
 SHRINK = 0.2
-# Delta-E (Lab distance) above which a spot is reported as "unknown".
-MAX_DIST = 30.0
+# A reading is "unknown" (not confident) when either:
+#  - it's farther than MAX_DIST (Lab delta-E) from every taught colour, or
+#  - the best match isn't clearly better than the runner-up: best distance must be
+#    at most MAX_RATIO x the second-best (0.6 = runner-up at least ~1.7x farther).
+MAX_DIST = 25.0
+MAX_RATIO = 0.6
 # Every frame is rescaled so the bare-table box reads this grey, cancelling
 # exposure / white-balance drift (otherwise a dim white sock looks like the table).
 TABLE_GREY = 180.0
@@ -129,11 +133,30 @@ def to_bgr_uint8(image, rgb: bool) -> np.ndarray:
     return cv2.cvtColor(image, cv2.COLOR_RGB2BGR) if rgb else image
 
 
-def nearest(lab: np.ndarray, refs: dict[str, np.ndarray], max_dist: float) -> tuple[str, float]:
-    """Closest taught colour and its distance; "unknown" if nothing is within max_dist."""
-    dists = {c: float(np.linalg.norm(r - lab, axis=1).min()) for c, r in refs.items()}
-    best = min(dists, key=dists.get)
-    return (best if dists[best] <= max_dist else UNKNOWN), dists[best]
+def ranked(lab: np.ndarray, refs: dict[str, np.ndarray]) -> list[tuple[float, str]]:
+    """[(distance, colour), ...] from closest to farthest taught colour."""
+    return sorted((float(np.linalg.norm(r - lab, axis=1).min()), c) for c, r in refs.items())
+
+
+def nearest(lab: np.ndarray, refs: dict[str, np.ndarray], max_dist: float = MAX_DIST,
+            max_ratio: float = MAX_RATIO) -> tuple[str, float]:
+    """Closest taught colour and its distance, or "unknown" if it isn't a confident match:
+    too far from every taught colour, or almost as close to a second colour."""
+    ranking = ranked(lab, refs)
+    best_d, best = ranking[0]
+    if best_d > max_dist:
+        return UNKNOWN, best_d
+    if len(ranking) > 1 and best_d > max_ratio * ranking[1][0]:
+        return UNKNOWN, best_d
+    return best, best_d
+
+
+def describe(lab: np.ndarray, refs: dict[str, np.ndarray], colour: str, dist: float) -> str:
+    """Human-readable result; for "unknown" also says which colours it was torn between."""
+    if colour != UNKNOWN:
+        return f"{colour} ({dist:.0f})"
+    r = ranked(lab, refs)
+    return f"unknown: {r[0][1]} {r[0][0]:.0f}" + (f" / {r[1][1]} {r[1][0]:.0f}" if len(r) > 1 else "")
 
 
 def centre_box(frac: float = CENTRE) -> list[float]:
@@ -149,8 +172,9 @@ def load_json(path: Path, hint: str) -> dict:
 class SockClassifier:
     """Loads spots.json + colours.json once; classify() is then a few milliseconds per frame."""
 
-    def __init__(self, spots_file=SPOTS_FILE, colours_file=COLOURS_FILE, max_dist=MAX_DIST):
+    def __init__(self, spots_file=SPOTS_FILE, colours_file=COLOURS_FILE, max_dist=MAX_DIST, max_ratio=MAX_RATIO):
         self.spots_file, self.colours_file, self.max_dist = Path(spots_file), Path(colours_file), max_dist
+        self.max_ratio = max_ratio
         self.reload()
 
     def reload(self):
@@ -185,7 +209,7 @@ class SockClassifier:
         scale = table_scale(frame, self.spots)
         out = {}
         for name, box in sock_spots(self.spots).items():
-            out[name] = nearest(spot_lab(frame, box, scale), self.refs, self.max_dist)
+            out[name] = nearest(spot_lab(frame, box, scale), self.refs, self.max_dist, self.max_ratio)
         return out
 
     def classify(self, image, rgb: bool = True) -> dict[str, str]:
@@ -216,7 +240,7 @@ class CloseUpClassifier:
     colours with the same camera at the same pose the robot uses.
     """
 
-    def __init__(self, colours_file=None, centre=CENTRE, max_dist=MAX_DIST):
+    def __init__(self, colours_file=None, centre=CENTRE, max_dist=MAX_DIST, max_ratio=MAX_RATIO):
         if colours_file is None:
             colours_file = CLOSEUP_COLOURS_FILE
             if not colours_file.exists():
@@ -224,6 +248,7 @@ class CloseUpClassifier:
                 print(f"[sock_classifier] No {CLOSEUP_COLOURS_FILE.name} yet, using the sample colours from phone "
                       "photos. Run `closeup-teach` with the arm camera for reliable results.")
         self.colours_file, self.box, self.max_dist = Path(colours_file), centre_box(centre), max_dist
+        self.max_ratio = max_ratio
         self.reload()
 
     def reload(self):
@@ -242,7 +267,8 @@ class CloseUpClassifier:
         return closeup_lab(to_bgr_uint8(image, rgb), self.box)
 
     def classify_detailed(self, image, rgb: bool = True) -> tuple[str, float]:
-        """(colour, distance); distance < ~10 is a confident match.
+        """(colour, distance); distance < ~10 is a confident match. "unknown" when not
+        confident: far from every taught colour, or nearly as close to two colours.
 
         `image` can be one frame or a list of frames. With several frames their colours
         are averaged (beats webcam noise) and each frame votes; if most frames disagree
@@ -250,9 +276,9 @@ class CloseUpClassifier:
         """
         frames = image if isinstance(image, (list, tuple)) else [image]
         labs = [self.lab(f, rgb) for f in frames]
-        colour, dist = nearest(np.median(labs, axis=0), self.refs, self.max_dist)
+        colour, dist = nearest(np.median(labs, axis=0), self.refs, self.max_dist, self.max_ratio)
         if len(labs) > 1:
-            votes = [nearest(lab, self.refs, self.max_dist)[0] for lab in labs]
+            votes = [nearest(lab, self.refs, self.max_dist, self.max_ratio)[0] for lab in labs]
             if votes.count(colour) <= len(votes) / 2:
                 colour = UNKNOWN
         return colour, dist
@@ -555,7 +581,7 @@ def cmd_teach(args):
 
 
 def cmd_run(args):
-    clf = SockClassifier(spots_file=SPOTS_FILE, max_dist=args.max_dist)
+    clf = SockClassifier(spots_file=SPOTS_FILE, max_dist=args.max_dist, max_ratio=args.max_ratio)
     if args.image:
         frame = get_frame(args)
         labels = clf.classify_detailed(frame, rgb=False)
@@ -630,12 +656,12 @@ def swatch(img: np.ndarray, lab: np.ndarray) -> np.ndarray:
 
 
 def cmd_closeup_run(args):
-    clf = CloseUpClassifier(centre=args.centre, max_dist=args.max_dist)
+    clf = CloseUpClassifier(centre=args.centre, max_dist=args.max_dist, max_ratio=args.max_ratio)
     print(f"Colours it knows: {clf.colour_names}  (from {clf.colours_file.name})")
 
     def show(frames, c, d):
-        img = draw_centre(fit(frames[-1]), args.centre, f"{c} ({d:.0f})")
-        return swatch(img, np.median([clf.lab(f, rgb=False) for f in frames], axis=0))
+        lab = np.median([clf.lab(f, rgb=False) for f in frames], axis=0)
+        return swatch(draw_centre(fit(frames[-1]), args.centre, describe(lab, clf.refs, c, d)), lab)
     if args.image:
         frame = get_frame(args)
         colour, dist = clf.classify_detailed(frame, rgb=False)
@@ -654,8 +680,9 @@ def cmd_closeup_run(args):
         cv2.imshow("run", banner(show(recent, colour, dist), "SPACE = robot-style reading    q = quit"))
         key = cv2.waitKey(1) & 0xFF
         if key == ord(" "):
-            colour, dist = clf.read(cam)
-            print(colour, f"(distance {dist:.1f})")
+            frames = cam.frames()
+            colour, dist = clf.classify_detailed(frames, rgb=False)
+            print(describe(np.median([clf.lab(f, rgb=False) for f in frames], axis=0), clf.refs, colour, dist))
         elif key in (ord("q"), 27):
             break
     cam.close()
@@ -667,7 +694,10 @@ if __name__ == "__main__":
     p.add_argument("command", choices=["closeup-teach", "closeup-run", "capture", "spots", "teach", "run"])
     p.add_argument("--camera", default="0", help="webcam index, or a stream / IP-cam snapshot URL")
     p.add_argument("--image", help="use a saved picture instead of the live camera")
-    p.add_argument("--max-dist", type=float, default=MAX_DIST)
+    p.add_argument("--max-dist", type=float, default=MAX_DIST,
+                   help="unknown if farther than this from every taught colour")
+    p.add_argument("--max-ratio", type=float, default=MAX_RATIO,
+                   help="unknown if best distance > this x second-best (lower = stricter)")
     p.add_argument("--free", action="store_true", help="teach: box each sock by hand instead of using spots.json")
     p.add_argument("--spots", default=str(SPOTS_FILE), help="spots file to use (default spots.json)")
     p.add_argument("--centre", type=float, default=CENTRE, help="close-up: fraction of the frame to read")
